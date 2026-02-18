@@ -1,0 +1,236 @@
+# 🚀 QUICKSTART GUIDE
+
+## Файлы в пакете
+
+```
+density-screener/
+├── README.md                    # Полная документация
+├── .env.example                 # Шаблон конфигурации
+├── requirements.txt             # Python зависимости
+├── docker-compose.yml           # Инфраструктура (Redis + PostgreSQL)
+├── schema.sql                   # Схема базы данных
+│
+├── config.py                    # Управление настройками
+├── models.py                    # SQLAlchemy модели
+├── database.py                  # Менеджер БД (Redis + PostgreSQL)
+│
+├── density_screener_prod.py     # 🎯 ОСНОВНОЙ БОТ (запускать это!)
+├── api_server.py                # 🌐 API сервер для Mini App
+│
+└── bouncebot.py                 # (старая версия, для справки)
+    density_screener.py          # (старая версия, для справки)
+```
+
+---
+
+## ⚡ Запуск за 5 минут
+
+### 1. Подготовка
+
+```bash
+# Установить зависимости
+pip install -r requirements.txt
+
+# Создать .env из шаблона
+cp .env.example .env
+
+# ОБЯЗАТЕЛЬНО: Отредактировать .env
+nano .env
+# Вставить ваши TELEGRAM_TOKEN и TELEGRAM_CHAT_ID
+```
+
+### 2. Запуск инфраструктуры
+
+```bash
+# Вариант А: Docker (рекомендуется)
+docker-compose up -d
+
+# Вариант Б: Локально (Redis + PostgreSQL должны быть установлены)
+# Если установлены локально, они запустятся автоматически
+```
+
+### 3. Проверка БД
+
+```bash
+# Подключиться к PostgreSQL и проверить схему
+docker exec -it screener_postgres psql -U screener -d density_screener
+
+# В psql:
+\dt                    # Список таблиц
+SELECT COUNT(*) FROM densities;
+\q
+```
+
+### 4. Запуск бота
+
+```bash
+# ОСНОВНОЙ БОТ — запускаем это!
+python density_screener_prod.py
+
+# Вы должны увидеть:
+# 🚀 Density Screener starting (Prod with Redis + PostgreSQL)
+# ✅ Redis connected: localhost:6379
+# ✅ PostgreSQL schema initialized
+# 🔌 WebSocket prices connected
+# ═══ CYCLE #1 | 69 coins | 12:00:00 UTC ═══
+```
+
+### 5. (Опционально) Запуск API для Mini App
+
+```bash
+# В отдельном терминале
+python api_server.py
+
+# Или через uvicorn с reload
+uvicorn api_server:app --reload --host 0.0.0.0 --port 8000
+```
+
+### 6. Проверка работы
+
+```bash
+# Проверить здоровье API
+curl http://localhost:8000/health
+
+# Получить топ плотностей
+curl http://localhost:8000/api/densities/top?limit=5
+
+# В Telegram отправить боту:
+/status
+/top
+/near
+```
+
+---
+
+## 📋 Checklist первого запуска
+
+- [ ] `pip install -r requirements.txt` выполнен
+- [ ] `.env` создан и заполнен (TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+- [ ] `docker-compose up -d` запущен (Redis + PostgreSQL работают)
+- [ ] `python density_screener_prod.py` запущен
+- [ ] Бот отвечает на команды в Telegram
+- [ ] (Опционально) `python api_server.py` запущен
+- [ ] (Опционально) `curl http://localhost:8000/health` возвращает OK
+
+---
+
+## 🔧 Troubleshooting
+
+### Ошибка: "ModuleNotFoundError"
+
+```bash
+# Переустановить зависимости
+pip install --upgrade -r requirements.txt
+```
+
+### Ошибка: "Redis connection failed"
+
+```bash
+# Проверить Docker контейнеры
+docker-compose ps
+
+# Перезапустить
+docker-compose restart redis
+
+# Проверить логи
+docker-compose logs redis
+```
+
+### Ошибка: "Database initialization failed"
+
+```bash
+# Пересоздать базу
+docker-compose down -v      # Удалит все данные!
+docker-compose up -d
+
+# Вручную загрузить схему
+psql -h localhost -U screener -d density_screener -f schema.sql
+# Password: screener_password_change_me
+```
+
+### Бот не отвечает в Telegram
+
+```bash
+# Проверить токен в .env
+cat .env | grep TELEGRAM_TOKEN
+
+# Проверить логи бота
+tail -f screener.log
+
+# Проверить что бот запущен
+ps aux | grep density_screener
+```
+
+### Rate limit 429 от Binance
+
+```bash
+# В .env увеличить задержки:
+BATCH_DELAY=3.0
+REQUEST_DELAY=0.3
+UPDATE_INTERVAL=90
+```
+
+---
+
+## 📚 Следующие шаги
+
+После успешного запуска:
+
+1. **Настроить пороги** — добавить кастомные threshold для монет через PostgreSQL
+2. **Мониторинг** — настроить systemd service для автозапуска
+3. **Mini App** — развернуть frontend и подключить к API
+4. **Мультибиржи** — добавить Bybit, OKX следуя инструкциям в README.md
+
+---
+
+## 🆘 Нужна помощь?
+
+- Полная документация: **README.md**
+- Логи бота: `tail -f screener.log`
+- Логи Docker: `docker-compose logs -f`
+- База данных: См. раздел "Database Queries" в README.md
+
+---
+
+## 🎯 Что дальше?
+
+### Запустить бота на production сервере
+
+```bash
+# 1. Клонировать код на сервер
+git clone your-repo.git
+cd density-screener
+
+# 2. Настроить .env с реальными данными
+
+# 3. Запустить как systemd service
+sudo cp density-screener.service /etc/systemd/system/
+sudo systemctl enable density-screener
+sudo systemctl start density-screener
+
+# 4. Настроить Nginx для API (если нужен Mini App)
+sudo cp nginx-api.conf /etc/nginx/sites-available/
+sudo ln -s /etc/nginx/sites-available/nginx-api.conf /etc/nginx/sites-enabled/
+sudo systemctl reload nginx
+```
+
+### Подключить Mini App
+
+1. Зарегистрировать Mini App через @BotFather
+2. Развернуть React frontend (пример в README.md)
+3. Указать URL вашего API в frontend
+4. Протестировать через Telegram
+
+### Добавить новую биржу
+
+1. Создать `scanners/bybit.py` по аналогии с Binance
+2. Добавить в `density_screener_prod.py`:
+   ```python
+   from scanners import bybit
+   store_bybit = DensityStore(exchange="bybit")
+   ```
+3. API автоматически поддержит новую биржу
+
+---
+
+Готово! 🚀 Бот работает.
