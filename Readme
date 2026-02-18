@@ -1,0 +1,715 @@
+# Density Screener — Production Architecture
+
+> Full-stack orderbook density screener with Redis + PostgreSQL + FastAPI + Telegram Mini App support
+
+## 📋 Table of Contents
+
+- [Architecture Overview](#architecture-overview)
+- [Features](#features)
+- [Quick Start](#quick-start)
+- [Detailed Setup](#detailed-setup)
+- [API Documentation](#api-documentation)
+- [Telegram Mini App Integration](#telegram-mini-app-integration)
+- [Adding New Exchanges](#adding-new-exchanges)
+- [Monitoring & Maintenance](#monitoring--maintenance)
+
+---
+
+## 🏗️ Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      BINANCE API                            │
+│                  (WebSocket + REST)                         │
+└────────────────────┬────────────────────────────────────────┘
+                     │
+┌────────────────────▼────────────────────────────────────────┐
+│              DENSITY SCREENER BOT                           │
+│         (density_screener_prod.py)                          │
+│                                                             │
+│  • Fetches orderbook depth                                 │
+│  • Detects large densities                                 │
+│  • Tracks density lifecycle                                │
+└──────────┬─────────────────────────┬────────────────────────┘
+           │                         │
+           ▼                         ▼
+  ┌────────────────┐        ┌─────────────────┐
+  │     REDIS      │        │   POSTGRESQL    │
+  │                │        │                 │
+  │ • Price cache  │        │ • Densities     │
+  │ • Active data  │        │ • Events log    │
+  │ • 300s TTL     │        │ • Statistics    │
+  └────────┬───────┘        └────────┬────────┘
+           │                         │
+           └──────────┬──────────────┘
+                      │
+           ┌──────────▼──────────────────────┐
+           │      FASTAPI SERVER             │
+           │      (api_server.py)            │
+           │                                 │
+           │  • REST endpoints               │
+           │  • WebSocket streaming          │
+           │  • CORS for Mini App            │
+           └──────────┬──────────────────────┘
+                      │
+           ┌──────────▼──────────────────────┐
+           │   TELEGRAM MINI APP             │
+           │                                 │
+           │  • Real-time table              │
+           │  • Filters & sorting            │
+           │  • Charts (future)              │
+           └─────────────────────────────────┘
+```
+
+---
+
+## ✨ Features
+
+### Core Functionality
+- ✅ Real-time orderbook depth scanning
+- ✅ Large density detection (customizable thresholds)
+- ✅ Distance tracking from current price
+- ✅ Density lifecycle events (detected, approached, touched, disappeared)
+- ✅ Multi-symbol support with volume filtering
+
+### Storage & Persistence
+- ✅ **Redis** — Real-time cache with 300s TTL
+- ✅ **PostgreSQL** — Full history & event logging
+- ✅ Three-layer architecture (Memory → Redis → PostgreSQL)
+- ✅ Automatic cleanup of stale densities
+
+### API & Integration
+- ✅ **REST API** — /api/densities, /top, /near, /events
+- ✅ **WebSocket** — Real-time streaming to clients
+- ✅ **Health checks** — /health endpoint
+- ✅ **CORS enabled** — Ready for Mini App
+
+### Telegram Features
+- ✅ Bot commands: /top, /near, /symbol, /pause, /resume, /status
+- ✅ Cycle summaries with statistics
+- ✅ Smart batching (no spam)
+- ✅ Customizable notifications
+
+---
+
+## 🚀 Quick Start
+
+### 1. Prerequisites
+
+```bash
+# Required
+- Python 3.10+
+- Docker & Docker Compose
+- Telegram Bot Token (from @BotFather)
+
+# OR install Redis + PostgreSQL locally
+```
+
+### 2. Clone & Install
+
+```bash
+# Clone repository
+git clone <your-repo>
+cd density-screener
+
+# Install Python dependencies
+pip install -r requirements.txt
+
+# Copy environment template
+cp .env.example .env
+
+# Edit .env with your credentials
+nano .env
+```
+
+### 3. Start Infrastructure
+
+```bash
+# Start Redis + PostgreSQL with Docker
+docker-compose up -d
+
+# Check services are running
+docker-compose ps
+
+# Initialize database schema
+psql -h localhost -U screener -d density_screener -f schema.sql
+# Password: screener_password_change_me
+```
+
+### 4. Run Services
+
+```bash
+# Terminal 1: Start screener bot
+python density_screener_prod.py
+
+# Terminal 2: Start API server
+python api_server.py
+
+# Or use uvicorn directly
+uvicorn api_server:app --host 0.0.0.0 --port 8000 --reload
+```
+
+### 5. Verify
+
+```bash
+# Check bot logs
+tail -f screener.log
+
+# Test API
+curl http://localhost:8000/health
+curl http://localhost:8000/api/densities?limit=5
+
+# Check Telegram
+# Send /status to your bot
+```
+
+---
+
+## 📚 Detailed Setup
+
+### Environment Variables
+
+Edit `.env` file with your configuration:
+
+```bash
+# REQUIRED
+TELEGRAM_TOKEN=7694259585:AAHDgLyJjG6MMN9d_S8LQe39HFjom5rvlVM
+TELEGRAM_CHAT_ID=-1002838578041
+
+# OPTIONAL (defaults work for local Docker)
+REDIS_HOST=localhost
+POSTGRES_HOST=localhost
+POSTGRES_PASSWORD=your_secure_password
+
+# TUNE AS NEEDED
+VOLUME_THRESHOLD=50000000        # Min 24h volume
+DEFAULT_DENSITY_USD=1000000      # Min density size
+MAX_DISTANCE_PCT=0.05            # 5% max distance
+UPDATE_INTERVAL=60               # Seconds between scans
+```
+
+### Database Setup
+
+**Option A: Docker (Recommended)**
+
+```bash
+docker-compose up -d
+# Databases initialize automatically from schema.sql
+```
+
+**Option B: Manual Installation**
+
+```bash
+# Install Redis
+sudo apt-get install redis-server
+sudo systemctl start redis
+sudo systemctl enable redis
+
+# Install PostgreSQL
+sudo apt-get install postgresql postgresql-contrib
+sudo systemctl start postgresql
+sudo systemctl enable postgresql
+
+# Create database
+sudo -u postgres psql
+CREATE DATABASE density_screener;
+CREATE USER screener WITH PASSWORD 'your_password';
+GRANT ALL PRIVILEGES ON DATABASE density_screener TO screener;
+\q
+
+# Load schema
+psql -h localhost -U screener -d density_screener -f schema.sql
+```
+
+### Custom Thresholds
+
+Add symbol-specific thresholds directly in PostgreSQL:
+
+```sql
+-- Connect to database
+psql -h localhost -U screener -d density_screener
+
+-- Add custom thresholds
+INSERT INTO thresholds (exchange, symbol, threshold_usd) VALUES
+    ('binance', 'SOLUSDT', 2000000),
+    ('binance', 'AVAXUSDT', 1500000),
+    ('binance', 'LINKUSDT', 1500000)
+ON CONFLICT (exchange, symbol) 
+DO UPDATE SET threshold_usd = EXCLUDED.threshold_usd;
+```
+
+---
+
+## 🔌 API Documentation
+
+### Base URL
+```
+http://localhost:8000
+```
+
+### Endpoints
+
+#### GET /api/densities
+Get active densities with filters
+
+**Query Parameters:**
+- `exchange` (string, default: "binance")
+- `symbol` (string, optional) — Filter by symbol
+- `max_distance` (float, default: 0.05) — Max distance %
+- `limit` (int, default: 100)
+
+**Example:**
+```bash
+curl "http://localhost:8000/api/densities?symbol=SOLUSDT&limit=10"
+```
+
+**Response:**
+```json
+[
+  {
+    "id": 123,
+    "exchange": "binance",
+    "symbol": "SOLUSDT",
+    "side": "bids",
+    "price": 84.42,
+    "notional": 1500000,
+    "current_price": 84.89,
+    "distance_pct": 0.0055,
+    "age_seconds": 125.3,
+    "side_emoji": "🟢 BID",
+    "is_active": true,
+    "first_seen": "2026-02-17T12:00:00",
+    "last_updated": "2026-02-17T12:02:00"
+  }
+]
+```
+
+#### GET /api/densities/top
+Get top N largest densities
+
+**Query Parameters:**
+- `exchange` (string, default: "binance")
+- `limit` (int, default: 10)
+
+**Example:**
+```bash
+curl "http://localhost:8000/api/densities/top?limit=5"
+```
+
+#### GET /api/densities/near
+Get densities very close to price
+
+**Query Parameters:**
+- `exchange` (string, default: "binance")
+- `threshold` (float, default: 0.01) — Max distance %
+- `limit` (int, default: 50)
+
+**Example:**
+```bash
+curl "http://localhost:8000/api/densities/near?threshold=0.005"
+```
+
+#### GET /api/densities/{symbol}
+Get all densities for specific symbol
+
+**Path Parameters:**
+- `symbol` (string, required)
+
+**Example:**
+```bash
+curl "http://localhost:8000/api/densities/SOLUSDT"
+```
+
+#### GET /api/events/recent
+Get recent density events
+
+**Query Parameters:**
+- `hours` (int, default: 24)
+- `event_type` (string, optional) — Filter by type
+- `limit` (int, default: 100)
+
+**Event Types:**
+- `detected` — New density found
+- `approached` — Price within 1%
+- `touched` — Price reached density
+- `disappeared` — Density removed
+- `broken` — Price crossed density
+
+**Example:**
+```bash
+curl "http://localhost:8000/api/events/recent?event_type=touched&hours=6"
+```
+
+#### WS /ws/densities
+WebSocket for real-time updates
+
+**Connection:**
+```javascript
+const ws = new WebSocket('ws://localhost:8000/ws/densities');
+
+ws.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  console.log(data);
+};
+
+// Message types:
+// - snapshot: Initial data on connect
+// - new: New density detected
+// - updated: Density changed
+// - disappeared: Density removed
+```
+
+#### GET /health
+Health check
+
+**Response:**
+```json
+{
+  "status": "healthy",
+  "timestamp": "2026-02-17T12:00:00",
+  "redis_connected": true,
+  "postgres_connected": true
+}
+```
+
+### Interactive Documentation
+
+FastAPI provides auto-generated docs:
+
+```bash
+# Swagger UI
+http://localhost:8000/docs
+
+# ReDoc
+http://localhost:8000/redoc
+```
+
+---
+
+## 📱 Telegram Mini App Integration
+
+### Step 1: Register Mini App
+
+1. Talk to @BotFather
+2. Send `/newapp`
+3. Select your bot
+4. Enter app name, description, photo
+5. Enter Web App URL: `https://your-domain.com/miniapp`
+
+### Step 2: Add Button to Bot
+
+```python
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+
+keyboard = [[
+    InlineKeyboardButton(
+        "🔍 Открыть скринер",
+        web_app=WebAppInfo(url="https://your-domain.com/miniapp")
+    )
+]]
+reply_markup = InlineKeyboardMarkup(keyboard)
+
+await bot.send_message(
+    chat_id=chat_id,
+    text="Нажмите кнопку для запуска скринера:",
+    reply_markup=reply_markup
+)
+```
+
+### Step 3: Frontend Integration
+
+```javascript
+// Initialize Telegram WebApp
+const tg = window.Telegram.WebApp;
+tg.ready();
+
+// Get user info
+const userId = tg.initDataUnsafe.user.id;
+const username = tg.initDataUnsafe.user.username;
+
+// Connect to WebSocket
+const ws = new WebSocket('wss://your-api.com/ws/densities');
+
+ws.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  updateTable(data);
+};
+
+// Fetch initial data
+fetch('https://your-api.com/api/densities?limit=50')
+  .then(res => res.json())
+  .then(data => renderTable(data));
+```
+
+### Frontend Example (React)
+
+```jsx
+import { useEffect, useState } from 'react';
+
+function DensityTable() {
+  const [densities, setDensities] = useState([]);
+
+  useEffect(() => {
+    const ws = new WebSocket('ws://localhost:8000/ws/densities');
+    
+    ws.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+      if (msg.type === 'snapshot') {
+        setDensities(msg.data);
+      } else if (msg.type === 'new') {
+        setDensities(prev => [msg.data, ...prev]);
+      }
+    };
+
+    return () => ws.close();
+  }, []);
+
+  return (
+    <table>
+      <thead>
+        <tr>
+          <th>Symbol</th>
+          <th>Side</th>
+          <th>Price</th>
+          <th>Size</th>
+          <th>Distance</th>
+        </tr>
+      </thead>
+      <tbody>
+        {densities.map(d => (
+          <tr key={d.id}>
+            <td>{d.symbol}</td>
+            <td>{d.side_emoji}</td>
+            <td>{d.price.toFixed(4)}</td>
+            <td>${(d.notional / 1000000).toFixed(2)}M</td>
+            <td>{(d.distance_pct * 100).toFixed(2)}%</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+```
+
+---
+
+## 🔄 Adding New Exchanges
+
+### 1. Add Exchange Scanner
+
+Create `scanners/bybit.py`:
+
+```python
+async def scan_bybit_symbol(session, symbol, threshold, store):
+    url = f"https://api.bybit.com/v5/market/orderbook?symbol={symbol}&limit=500"
+    # ... similar to Binance scan_symbol
+    # Update store with exchange="bybit"
+```
+
+### 2. Update Screener
+
+In `density_screener_prod.py`:
+
+```python
+from scanners import bybit
+
+# Add Bybit store
+store_bybit = DensityStore(exchange="bybit")
+
+# In main loop:
+bybit_symbols = await bybit.fetch_symbols()
+for symbol in bybit_symbols:
+    await bybit.scan_bybit_symbol(session, symbol, threshold, store_bybit)
+```
+
+### 3. No API Changes Needed
+
+The API automatically supports multiple exchanges:
+
+```bash
+curl "http://localhost:8000/api/densities?exchange=bybit"
+```
+
+---
+
+## 🔧 Monitoring & Maintenance
+
+### Logs
+
+```bash
+# Real-time logs
+tail -f screener.log
+
+# Filter errors
+tail -f screener.log | grep ERROR
+
+# Bot logs
+docker-compose logs -f screener
+```
+
+### Database Queries
+
+```sql
+-- Active densities count
+SELECT exchange, COUNT(*) FROM densities WHERE is_active GROUP BY exchange;
+
+-- Recent events
+SELECT * FROM density_events ORDER BY created_at DESC LIMIT 10;
+
+-- Top symbols by density count
+SELECT symbol, COUNT(*) as cnt 
+FROM densities 
+WHERE is_active 
+GROUP BY symbol 
+ORDER BY cnt DESC 
+LIMIT 10;
+
+-- Events statistics
+SELECT event_type, COUNT(*) 
+FROM density_events 
+WHERE created_at >= NOW() - INTERVAL '24 hours'
+GROUP BY event_type;
+```
+
+### Redis Monitoring
+
+```bash
+# Connect to Redis
+redis-cli
+
+# Check keys
+KEYS density:*
+KEYS price:*
+
+# Get key value
+GET density:binance:SOLUSDT:bids:84.42
+
+# Monitor commands
+MONITOR
+```
+
+### Performance Tuning
+
+**Increase scan speed:**
+```bash
+# .env
+BATCH_SIZE=15          # More symbols per batch
+BATCH_DELAY=1.5        # Less delay between batches
+UPDATE_INTERVAL=45     # Faster cycles
+```
+
+**Reduce memory usage:**
+```bash
+# docker-compose.yml - Redis
+command: redis-server --maxmemory 256mb
+```
+
+**Database optimization:**
+```sql
+-- Add indexes if queries are slow
+CREATE INDEX idx_densities_notional ON densities(notional DESC) WHERE is_active;
+CREATE INDEX idx_events_symbol ON density_events(density_id, created_at DESC);
+
+-- Cleanup old inactive densities
+DELETE FROM densities WHERE is_active = FALSE AND last_updated < NOW() - INTERVAL '7 days';
+```
+
+### Backup
+
+```bash
+# PostgreSQL backup
+docker exec screener_postgres pg_dump -U screener density_screener > backup_$(date +%Y%m%d).sql
+
+# Redis backup
+docker exec screener_redis redis-cli SAVE
+docker cp screener_redis:/data/dump.rdb ./redis_backup_$(date +%Y%m%d).rdb
+
+# Restore
+psql -h localhost -U screener -d density_screener < backup_20260217.sql
+docker cp redis_backup_20260217.rdb screener_redis:/data/dump.rdb
+docker restart screener_redis
+```
+
+---
+
+## 📦 Production Deployment
+
+### Docker Deployment
+
+```bash
+# Build images
+docker build -t density-screener:latest .
+
+# Run with docker-compose
+docker-compose -f docker-compose.prod.yml up -d
+```
+
+### Systemd Service
+
+Create `/etc/systemd/system/density-screener.service`:
+
+```ini
+[Unit]
+Description=Density Screener Bot
+After=network.target docker.service
+
+[Service]
+Type=simple
+User=your_user
+WorkingDirectory=/home/your_user/density-screener
+ExecStart=/usr/bin/python3 density_screener_prod.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable density-screener
+sudo systemctl start density-screener
+sudo systemctl status density-screener
+```
+
+### Nginx Reverse Proxy
+
+```nginx
+server {
+    listen 80;
+    server_name api.yourdomain.com;
+
+    location / {
+        proxy_pass http://localhost:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+```
+
+---
+
+## 📄 License
+
+MIT License
+
+---
+
+## 🤝 Contributing
+
+Pull requests welcome! Please:
+1. Fork the repository
+2. Create feature branch
+3. Test thoroughly
+4. Submit PR with description
+
+---
+
+## 📞 Support
+
+- Issues: GitHub Issues
+- Telegram: @your_support_channel
+- Email: support@yourdomain.com
