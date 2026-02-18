@@ -1,0 +1,385 @@
+"""
+╔══════════════════════════════════════════════════════════════╗
+║              FASTAPI SERVER — TELEGRAM MINI APP              ║
+║                  REST + WebSocket endpoints                  ║
+╚══════════════════════════════════════════════════════════════╝
+
+Provides:
+  • GET  /api/densities              — list active densities
+  • GET  /api/densities/top          — top densities by size
+  • GET  /api/densities/near         — densities close to price
+  • GET  /api/densities/{symbol}     — densities for specific symbol
+  • GET  /api/events/recent          — recent density events
+  • GET  /api/stats/symbols          — symbol statistics
+  • WS   /ws/densities               — realtime updates
+  • GET  /health                     — health check
+"""
+
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import List, Optional
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+from config import settings
+from database import db
+
+log = logging.getLogger(__name__)
+
+# ═══════════════════════════════════════════════════════
+#  LIFESPAN CONTEXT
+# ═══════════════════════════════════════════════════════
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize and cleanup resources"""
+    log.info("🚀 Starting API server...")
+    await db.init_redis()
+    await db.init_db()
+    log.info("✅ Databases initialized")
+    
+    yield
+    
+    log.info("🛑 Shutting down API server...")
+    await db.close()
+
+
+# ═══════════════════════════════════════════════════════
+#  FASTAPI APP
+# ═══════════════════════════════════════════════════════
+app = FastAPI(
+    title="Density Screener API",
+    description="Orderbook density screener for Telegram Mini App",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# CORS for Mini App
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production: restrict to Telegram domains
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ═══════════════════════════════════════════════════════
+#  PYDANTIC MODELS
+# ═══════════════════════════════════════════════════════
+class DensityResponse(BaseModel):
+    id: Optional[int]
+    exchange: str
+    symbol: str
+    side: str
+    price: float
+    notional: float
+    current_price: float
+    distance_pct: float
+    age_seconds: float
+    side_emoji: str
+    is_active: bool
+    first_seen: str
+    last_updated: str
+
+
+class EventResponse(BaseModel):
+    id: int
+    density_id: int
+    event_type: str
+    price_at_event: Optional[float]
+    distance_pct_at_event: Optional[float]
+    notional_at_event: Optional[float]
+    created_at: str
+
+
+class StatsResponse(BaseModel):
+    exchange: str
+    symbol: str
+    total_densities: int
+    avg_density_size: float
+    largest_density: float
+    detected_count: int
+    touched_count: int
+    broken_count: int
+    last_scan: str
+
+
+class HealthResponse(BaseModel):
+    status: str
+    timestamp: str
+    redis_connected: bool
+    postgres_connected: bool
+
+
+# ═══════════════════════════════════════════════════════
+#  WEBSOCKET CONNECTION MANAGER
+# ═══════════════════════════════════════════════════════
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        log.info(f"📱 WebSocket client connected. Total: {len(self.active_connections)}")
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+        log.info(f"📴 WebSocket client disconnected. Total: {len(self.active_connections)}")
+
+    async def broadcast(self, message: dict):
+        """Broadcast message to all connected clients"""
+        dead_connections = []
+        for connection in self.active_connections:
+            try:
+                await connection.send_json(message)
+            except Exception as e:
+                log.error(f"Error broadcasting to client: {e}")
+                dead_connections.append(connection)
+        
+        for connection in dead_connections:
+            self.disconnect(connection)
+
+
+manager = ConnectionManager()
+
+
+# ═══════════════════════════════════════════════════════
+#  ENDPOINTS — DENSITIES
+# ═══════════════════════════════════════════════════════
+@app.get("/api/densities", response_model=List[DensityResponse])
+async def get_densities(
+    exchange: str = Query(default="binance", description="Exchange name"),
+    symbol: Optional[str] = Query(default=None, description="Filter by symbol"),
+    max_distance: float = Query(default=0.05, description="Max distance from price (%)"),
+    limit: int = Query(default=100, description="Max results")
+):
+    """Get active densities with filters"""
+    try:
+        # Try Redis cache first
+        cached = await db.get_active_densities_cached(exchange, max_distance)
+        if cached and not symbol:
+            return cached[:limit]
+        
+        # Fallback to PostgreSQL
+        densities = await db.get_active_densities(exchange, symbol, max_distance, limit)
+        return [d.to_dict() for d in densities]
+    
+    except Exception as e:
+        log.error(f"Error fetching densities: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/densities/top", response_model=List[DensityResponse])
+async def get_top_densities(
+    exchange: str = Query(default="binance"),
+    limit: int = Query(default=10, description="Top N densities")
+):
+    """Get top densities by notional size"""
+    try:
+        densities = await db.get_active_densities(
+            exchange=exchange,
+            max_distance=1.0,  # Get all
+            limit=limit
+        )
+        # Sort by notional descending
+        densities.sort(key=lambda d: float(d.notional), reverse=True)
+        return [d.to_dict() for d in densities[:limit]]
+    
+    except Exception as e:
+        log.error(f"Error fetching top densities: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/densities/near", response_model=List[DensityResponse])
+async def get_near_densities(
+    exchange: str = Query(default="binance"),
+    threshold: float = Query(default=0.01, description="Distance threshold (%)"),
+    limit: int = Query(default=50)
+):
+    """Get densities very close to current price"""
+    try:
+        densities = await db.get_active_densities(
+            exchange=exchange,
+            max_distance=threshold,
+            limit=limit
+        )
+        return [d.to_dict() for d in densities]
+    
+    except Exception as e:
+        log.error(f"Error fetching near densities: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/densities/{symbol}", response_model=List[DensityResponse])
+async def get_symbol_densities(
+    symbol: str,
+    exchange: str = Query(default="binance"),
+    limit: int = Query(default=20)
+):
+    """Get all densities for specific symbol"""
+    try:
+        symbol = symbol.upper()
+        if not symbol.endswith("USDT"):
+            symbol += "USDT"
+        
+        densities = await db.get_active_densities(
+            exchange=exchange,
+            symbol=symbol,
+            max_distance=1.0,
+            limit=limit
+        )
+        return [d.to_dict() for d in densities]
+    
+    except Exception as e:
+        log.error(f"Error fetching symbol densities: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═══════════════════════════════════════════════════════
+#  ENDPOINTS — EVENTS
+# ═══════════════════════════════════════════════════════
+@app.get("/api/events/recent", response_model=List[EventResponse])
+async def get_recent_events(
+    hours: int = Query(default=24, description="Last N hours"),
+    event_type: Optional[str] = Query(default=None, description="Filter by event type"),
+    limit: int = Query(default=100)
+):
+    """Get recent density events"""
+    try:
+        events = await db.get_recent_events(hours, event_type, limit)
+        return [e.to_dict() for e in events]
+    
+    except Exception as e:
+        log.error(f"Error fetching events: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═══════════════════════════════════════════════════════
+#  ENDPOINTS — STATISTICS
+# ═══════════════════════════════════════════════════════
+@app.get("/api/stats/symbols")
+async def get_symbol_stats(
+    exchange: str = Query(default="binance")
+):
+    """Get aggregated statistics for all symbols"""
+    try:
+        # This would query symbol_stats table
+        # For now, return placeholder
+        return {"message": "Statistics endpoint - coming soon"}
+    
+    except Exception as e:
+        log.error(f"Error fetching stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═══════════════════════════════════════════════════════
+#  WEBSOCKET — REALTIME UPDATES
+# ═══════════════════════════════════════════════════════
+@app.websocket("/ws/densities")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket for realtime density updates"""
+    await manager.connect(websocket)
+    
+    try:
+        # Send initial snapshot
+        densities = await db.get_active_densities(
+            exchange="binance",
+            max_distance=0.05,
+            limit=50
+        )
+        await websocket.send_json({
+            "type": "snapshot",
+            "data": [d.to_dict() for d in densities],
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+        # Keep connection alive and listen for client messages
+        while True:
+            data = await websocket.receive_text()
+            # Echo or handle client commands if needed
+            await websocket.send_json({
+                "type": "pong",
+                "timestamp": datetime.utcnow().isoformat()
+            })
+    
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception as e:
+        log.error(f"WebSocket error: {e}")
+        manager.disconnect(websocket)
+
+
+# ═══════════════════════════════════════════════════════
+#  UTILITY ENDPOINTS
+# ═══════════════════════════════════════════════════════
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Health check endpoint"""
+    redis_ok = False
+    postgres_ok = False
+    
+    try:
+        await db.redis.ping()
+        redis_ok = True
+    except:
+        pass
+    
+    try:
+        async with db.session() as session:
+            await session.execute("SELECT 1")
+        postgres_ok = True
+    except:
+        pass
+    
+    status = "healthy" if (redis_ok and postgres_ok) else "degraded"
+    
+    return {
+        "status": status,
+        "timestamp": datetime.utcnow().isoformat(),
+        "redis_connected": redis_ok,
+        "postgres_connected": postgres_ok
+    }
+
+
+@app.get("/")
+async def root():
+    """API root"""
+    return {
+        "name": "Density Screener API",
+        "version": "1.0.0",
+        "docs": "/docs",
+        "health": "/health"
+    }
+
+
+# ═══════════════════════════════════════════════════════
+#  BROADCAST HELPER (called from screener bot)
+# ═══════════════════════════════════════════════════════
+async def broadcast_density_update(density: dict, event_type: str = "new"):
+    """Broadcast density update to all WebSocket clients"""
+    await manager.broadcast({
+        "type": event_type,  # "new", "updated", "disappeared"
+        "data": density,
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+
+# ═══════════════════════════════════════════════════════
+#  RUN SERVER
+# ═══════════════════════════════════════════════════════
+if __name__ == "__main__":
+    import uvicorn
+    
+    uvicorn.run(
+        "api_server:app",
+        host=settings.api_host,
+        port=settings.api_port,
+        reload=settings.api_reload,
+        log_level=settings.log_level.lower()
+    )
