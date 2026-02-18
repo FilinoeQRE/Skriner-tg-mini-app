@@ -1,0 +1,227 @@
+-- ═══════════════════════════════════════════════════════
+-- POSTGRESQL SCHEMA — Density Screener
+-- ═══════════════════════════════════════════════════════
+
+-- 1. Плотности (актуальное состояние)
+CREATE TABLE IF NOT EXISTS densities (
+    id SERIAL PRIMARY KEY,
+    exchange VARCHAR(20) NOT NULL,
+    symbol VARCHAR(20) NOT NULL,
+    side VARCHAR(4) NOT NULL CHECK (side IN ('bids', 'asks')),
+    price DECIMAL(20, 8) NOT NULL,
+    notional DECIMAL(20, 2) NOT NULL,
+    current_price DECIMAL(20, 8) NOT NULL,
+    distance_pct DECIMAL(8, 6) NOT NULL,
+    first_seen TIMESTAMP NOT NULL DEFAULT NOW(),
+    last_updated TIMESTAMP NOT NULL DEFAULT NOW(),
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    
+    UNIQUE(exchange, symbol, side, price)
+);
+
+CREATE INDEX idx_densities_active ON densities(exchange, symbol, is_active);
+CREATE INDEX idx_densities_distance ON densities(distance_pct) WHERE is_active = TRUE;
+CREATE INDEX idx_densities_symbol ON densities(symbol) WHERE is_active = TRUE;
+
+-- 2. События плотностей (история)
+CREATE TABLE IF NOT EXISTS density_events (
+    id SERIAL PRIMARY KEY,
+    density_id INTEGER REFERENCES densities(id) ON DELETE CASCADE,
+    event_type VARCHAR(20) NOT NULL CHECK (event_type IN (
+        'detected',    -- найдена новая плотность
+        'approached',  -- цена приблизилась (< 1%)
+        'touched',     -- цена коснулась уровня
+        'disappeared', -- плотность исчезла
+        'broken'       -- цена пробила уровень
+    )),
+    price_at_event DECIMAL(20, 8),
+    distance_pct_at_event DECIMAL(8, 6),
+    notional_at_event DECIMAL(20, 2),
+    metadata JSONB,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_events_density ON density_events(density_id);
+CREATE INDEX idx_events_type ON density_events(event_type, created_at DESC);
+CREATE INDEX idx_events_time ON density_events(created_at DESC);
+
+-- 3. Статистика по символам (агрегированные данные)
+CREATE TABLE IF NOT EXISTS symbol_stats (
+    id SERIAL PRIMARY KEY,
+    exchange VARCHAR(20) NOT NULL,
+    symbol VARCHAR(20) NOT NULL,
+    total_densities INTEGER NOT NULL DEFAULT 0,
+    avg_density_size DECIMAL(20, 2),
+    largest_density DECIMAL(20, 2),
+    detected_count INTEGER NOT NULL DEFAULT 0,
+    touched_count INTEGER NOT NULL DEFAULT 0,
+    broken_count INTEGER NOT NULL DEFAULT 0,
+    last_scan TIMESTAMP NOT NULL DEFAULT NOW(),
+    
+    UNIQUE(exchange, symbol)
+);
+
+CREATE INDEX idx_symbol_stats_lookup ON symbol_stats(exchange, symbol);
+
+-- 4. Конфигурация порогов (кастомные пороги для символов)
+CREATE TABLE IF NOT EXISTS thresholds (
+    id SERIAL PRIMARY KEY,
+    exchange VARCHAR(20) NOT NULL,
+    symbol VARCHAR(20) NOT NULL,
+    threshold_usd DECIMAL(20, 2) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    
+    UNIQUE(exchange, symbol)
+);
+
+-- 5. Пользователи (для будущей авторизации через Telegram)
+CREATE TABLE IF NOT EXISTS users (
+    id SERIAL PRIMARY KEY,
+    telegram_id BIGINT NOT NULL UNIQUE,
+    username VARCHAR(100),
+    first_name VARCHAR(100),
+    last_name VARCHAR(100),
+    language_code VARCHAR(10),
+    is_premium BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    last_active TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_users_telegram ON users(telegram_id);
+
+-- 6. Подписки пользователей (watchlist)
+CREATE TABLE IF NOT EXISTS user_watchlist (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    exchange VARCHAR(20) NOT NULL,
+    symbol VARCHAR(20) NOT NULL,
+    notify_on_approach BOOLEAN NOT NULL DEFAULT TRUE,
+    notify_on_touch BOOLEAN NOT NULL DEFAULT TRUE,
+    custom_threshold DECIMAL(20, 2),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    
+    UNIQUE(user_id, exchange, symbol)
+);
+
+CREATE INDEX idx_watchlist_user ON user_watchlist(user_id);
+
+-- ═══════════════════════════════════════════════════════
+-- ФУНКЦИИ И ТРИГГЕРЫ
+-- ═══════════════════════════════════════════════════════
+
+-- Автоматическое обновление last_updated
+CREATE OR REPLACE FUNCTION update_modified_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.last_updated = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER update_densities_modtime
+    BEFORE UPDATE ON densities
+    FOR EACH ROW
+    EXECUTE FUNCTION update_modified_column();
+
+-- Автоматическое логирование событий при изменении статуса
+CREATE OR REPLACE FUNCTION log_density_status_change()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF (OLD.is_active = TRUE AND NEW.is_active = FALSE) THEN
+        INSERT INTO density_events (density_id, event_type, price_at_event, distance_pct_at_event, notional_at_event)
+        VALUES (NEW.id, 'disappeared', NEW.current_price, NEW.distance_pct, NEW.notional);
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_density_status
+    AFTER UPDATE ON densities
+    FOR EACH ROW
+    WHEN (OLD.is_active IS DISTINCT FROM NEW.is_active)
+    EXECUTE FUNCTION log_density_status_change();
+
+-- ═══════════════════════════════════════════════════════
+-- ПРЕДСТАВЛЕНИЯ (VIEWS)
+-- ═══════════════════════════════════════════════════════
+
+-- Активные плотности с расстоянием < 5%
+CREATE OR REPLACE VIEW active_densities_near AS
+SELECT 
+    d.*,
+    CASE 
+        WHEN d.side = 'bids' THEN '🟢 BID'
+        ELSE '🔴 ASK'
+    END as side_emoji,
+    EXTRACT(EPOCH FROM (NOW() - d.first_seen)) as age_seconds
+FROM densities d
+WHERE d.is_active = TRUE 
+  AND d.distance_pct <= 0.05
+ORDER BY d.distance_pct ASC, d.notional DESC;
+
+-- Топ плотностей по размеру
+CREATE OR REPLACE VIEW top_densities AS
+SELECT 
+    d.*,
+    CASE 
+        WHEN d.side = 'bids' THEN '🟢 BID'
+        ELSE '🔴 ASK'
+    END as side_emoji
+FROM densities d
+WHERE d.is_active = TRUE
+ORDER BY d.notional DESC
+LIMIT 50;
+
+-- Статистика событий по символам за последние 24 часа
+CREATE OR REPLACE VIEW symbol_event_stats_24h AS
+SELECT 
+    d.exchange,
+    d.symbol,
+    COUNT(DISTINCT d.id) as total_densities,
+    COUNT(CASE WHEN e.event_type = 'touched' THEN 1 END) as touched_count,
+    COUNT(CASE WHEN e.event_type = 'broken' THEN 1 END) as broken_count,
+    AVG(d.notional) as avg_notional,
+    MAX(d.notional) as max_notional
+FROM densities d
+LEFT JOIN density_events e ON e.density_id = d.id 
+    AND e.created_at >= NOW() - INTERVAL '24 hours'
+WHERE d.first_seen >= NOW() - INTERVAL '24 hours'
+GROUP BY d.exchange, d.symbol
+ORDER BY total_densities DESC;
+
+-- ═══════════════════════════════════════════════════════
+-- SEED DATA (начальные данные)
+-- ═══════════════════════════════════════════════════════
+
+-- Дефолтные пороги для популярных монет
+INSERT INTO thresholds (exchange, symbol, threshold_usd) VALUES
+    ('binance', 'SOLUSDT', 2000000),
+    ('binance', 'ADAUSDT', 1500000),
+    ('binance', 'XRPUSDT', 2500000),
+    ('binance', 'DOGEUSDT', 1000000),
+    ('binance', 'AVAXUSDT', 1500000),
+    ('binance', 'LINKUSDT', 1500000),
+    ('binance', 'MATICUSDT', 1000000),
+    ('binance', 'ATOMUSDT', 1000000)
+ON CONFLICT (exchange, symbol) DO NOTHING;
+
+-- ═══════════════════════════════════════════════════════
+-- ПОЛЕЗНЫЕ ЗАПРОСЫ ДЛЯ ОТЛАДКИ
+-- ═══════════════════════════════════════════════════════
+
+-- Все активные плотности
+-- SELECT * FROM active_densities_near LIMIT 20;
+
+-- Топ-10 крупнейших
+-- SELECT * FROM top_densities LIMIT 10;
+
+-- События за последний час
+-- SELECT * FROM density_events WHERE created_at >= NOW() - INTERVAL '1 hour' ORDER BY created_at DESC;
+
+-- Плотности с событиями
+-- SELECT d.symbol, d.price, d.notional, e.event_type, e.created_at 
+-- FROM densities d 
+-- JOIN density_events e ON e.density_id = d.id 
+-- WHERE d.symbol = 'SOLUSDT' 
+-- ORDER BY e.created_at DESC;
