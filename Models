@@ -1,0 +1,218 @@
+"""
+SQLAlchemy models for PostgreSQL
+"""
+
+from datetime import datetime
+from decimal import Decimal
+from sqlalchemy import (
+    Boolean, CheckConstraint, Column, DateTime, Enum, 
+    ForeignKey, Integer, Numeric, String, UniqueConstraint, Index, JSON
+)
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
+
+Base = declarative_base()
+
+
+class Density(Base):
+    """Актуальное состояние плотностей в ордербуке"""
+    __tablename__ = 'densities'
+    
+    id = Column(Integer, primary_key=True)
+    exchange = Column(String(20), nullable=False, index=True)
+    symbol = Column(String(20), nullable=False, index=True)
+    side = Column(String(4), CheckConstraint("side IN ('bids', 'asks')"), nullable=False)
+    price = Column(Numeric(20, 8), nullable=False)
+    notional = Column(Numeric(20, 2), nullable=False)
+    current_price = Column(Numeric(20, 8), nullable=False)
+    distance_pct = Column(Numeric(8, 6), nullable=False, index=True)
+    first_seen = Column(DateTime, nullable=False, default=func.now())
+    last_updated = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
+    is_active = Column(Boolean, nullable=False, default=True, index=True)
+    
+    # Relationships
+    events = relationship("DensityEvent", back_populates="density", cascade="all, delete-orphan")
+    
+    __table_args__ = (
+        UniqueConstraint('exchange', 'symbol', 'side', 'price', name='uq_density'),
+        Index('idx_active_symbol', 'symbol', 'is_active'),
+        Index('idx_active_distance', 'distance_pct', postgresql_where="is_active = true"),
+    )
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'exchange': self.exchange,
+            'symbol': self.symbol,
+            'side': self.side,
+            'price': float(self.price),
+            'notional': float(self.notional),
+            'current_price': float(self.current_price),
+            'distance_pct': float(self.distance_pct),
+            'first_seen': self.first_seen.isoformat(),
+            'last_updated': self.last_updated.isoformat(),
+            'is_active': self.is_active,
+            'age_seconds': (datetime.utcnow() - self.first_seen).total_seconds() if self.first_seen else 0,
+            'side_emoji': '🟢 BID' if self.side == 'bids' else '🔴 ASK'
+        }
+
+
+class DensityEvent(Base):
+    """История событий плотностей"""
+    __tablename__ = 'density_events'
+    
+    id = Column(Integer, primary_key=True)
+    density_id = Column(Integer, ForeignKey('densities.id', ondelete='CASCADE'), nullable=False, index=True)
+    event_type = Column(
+        String(20),
+        CheckConstraint("event_type IN ('detected', 'approached', 'touched', 'disappeared', 'broken')"),
+        nullable=False,
+        index=True
+    )
+    price_at_event = Column(Numeric(20, 8))
+    distance_pct_at_event = Column(Numeric(8, 6))
+    notional_at_event = Column(Numeric(20, 2))
+    metadata = Column(JSON)
+    created_at = Column(DateTime, nullable=False, default=func.now(), index=True)
+    
+    # Relationships
+    density = relationship("Density", back_populates="events")
+    
+    __table_args__ = (
+        Index('idx_event_type_time', 'event_type', 'created_at'),
+    )
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'density_id': self.density_id,
+            'event_type': self.event_type,
+            'price_at_event': float(self.price_at_event) if self.price_at_event else None,
+            'distance_pct_at_event': float(self.distance_pct_at_event) if self.distance_pct_at_event else None,
+            'notional_at_event': float(self.notional_at_event) if self.notional_at_event else None,
+            'metadata': self.metadata,
+            'created_at': self.created_at.isoformat()
+        }
+
+
+class SymbolStats(Base):
+    """Агрегированная статистика по символам"""
+    __tablename__ = 'symbol_stats'
+    
+    id = Column(Integer, primary_key=True)
+    exchange = Column(String(20), nullable=False)
+    symbol = Column(String(20), nullable=False)
+    total_densities = Column(Integer, nullable=False, default=0)
+    avg_density_size = Column(Numeric(20, 2))
+    largest_density = Column(Numeric(20, 2))
+    detected_count = Column(Integer, nullable=False, default=0)
+    touched_count = Column(Integer, nullable=False, default=0)
+    broken_count = Column(Integer, nullable=False, default=0)
+    last_scan = Column(DateTime, nullable=False, default=func.now())
+    
+    __table_args__ = (
+        UniqueConstraint('exchange', 'symbol', name='uq_symbol_stats'),
+        Index('idx_stats_lookup', 'exchange', 'symbol'),
+    )
+    
+    def to_dict(self):
+        return {
+            'exchange': self.exchange,
+            'symbol': self.symbol,
+            'total_densities': self.total_densities,
+            'avg_density_size': float(self.avg_density_size) if self.avg_density_size else 0,
+            'largest_density': float(self.largest_density) if self.largest_density else 0,
+            'detected_count': self.detected_count,
+            'touched_count': self.touched_count,
+            'broken_count': self.broken_count,
+            'last_scan': self.last_scan.isoformat()
+        }
+
+
+class Threshold(Base):
+    """Кастомные пороги плотностей для символов"""
+    __tablename__ = 'thresholds'
+    
+    id = Column(Integer, primary_key=True)
+    exchange = Column(String(20), nullable=False)
+    symbol = Column(String(20), nullable=False)
+    threshold_usd = Column(Numeric(20, 2), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=func.now())
+    updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
+    
+    __table_args__ = (
+        UniqueConstraint('exchange', 'symbol', name='uq_threshold'),
+    )
+    
+    def to_dict(self):
+        return {
+            'exchange': self.exchange,
+            'symbol': self.symbol,
+            'threshold_usd': float(self.threshold_usd),
+            'created_at': self.created_at.isoformat(),
+            'updated_at': self.updated_at.isoformat()
+        }
+
+
+class User(Base):
+    """Пользователи Telegram"""
+    __tablename__ = 'users'
+    
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(Integer, nullable=False, unique=True, index=True)
+    username = Column(String(100))
+    first_name = Column(String(100))
+    last_name = Column(String(100))
+    language_code = Column(String(10))
+    is_premium = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, nullable=False, default=func.now())
+    last_active = Column(DateTime, nullable=False, default=func.now())
+    
+    # Relationships
+    watchlist = relationship("UserWatchlist", back_populates="user", cascade="all, delete-orphan")
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'telegram_id': self.telegram_id,
+            'username': self.username,
+            'first_name': self.first_name,
+            'last_name': self.last_name,
+            'is_premium': self.is_premium,
+            'created_at': self.created_at.isoformat(),
+            'last_active': self.last_active.isoformat()
+        }
+
+
+class UserWatchlist(Base):
+    """Персональные watchlist пользователей"""
+    __tablename__ = 'user_watchlist'
+    
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    exchange = Column(String(20), nullable=False)
+    symbol = Column(String(20), nullable=False)
+    notify_on_approach = Column(Boolean, nullable=False, default=True)
+    notify_on_touch = Column(Boolean, nullable=False, default=True)
+    custom_threshold = Column(Numeric(20, 2))
+    created_at = Column(DateTime, nullable=False, default=func.now())
+    
+    # Relationships
+    user = relationship("User", back_populates="watchlist")
+    
+    __table_args__ = (
+        UniqueConstraint('user_id', 'exchange', 'symbol', name='uq_user_watchlist'),
+    )
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'exchange': self.exchange,
+            'symbol': self.symbol,
+            'notify_on_approach': self.notify_on_approach,
+            'notify_on_touch': self.notify_on_touch,
+            'custom_threshold': float(self.custom_threshold) if self.custom_threshold else None,
+            'created_at': self.created_at.isoformat()
+        }
