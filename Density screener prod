@@ -1,0 +1,632 @@
+"""
+╔══════════════════════════════════════════════════════════════╗
+║      BINANCE FUTURES — ORDERBOOK DENSITY SCREENER            ║
+║         Production version with Redis + PostgreSQL           ║
+╚══════════════════════════════════════════════════════════════╝
+
+Architecture:
+  • WebSocket  — realtime prices (no REST)
+  • REST batch — orderbook depth with rate-limit protection
+  • Redis      — realtime cache (300s TTL)
+  • PostgreSQL — persistent storage & history
+  • Notifier   — smart Telegram grouping
+  • Commander  — /top /near /symbol /pause /resume /status
+"""
+
+import aiohttp
+import asyncio
+import json
+import logging
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional, List
+
+from telegram import Bot, Update
+from telegram.ext import CommandHandler, Dispatcher, Updater
+
+from config import settings
+from database import db
+from models import Density as DBDensity
+
+# ═══════════════════════════════════════════════════════
+#  LOGGING
+# ═══════════════════════════════════════════════════════
+logging.basicConfig(
+    level=getattr(logging, settings.log_level.upper()),
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(settings.log_file, encoding="utf-8"),
+    ]
+)
+log = logging.getLogger(__name__)
+
+# ═══════════════════════════════════════════════════════
+#  DATA CLASSES
+# ═══════════════════════════════════════════════════════
+@dataclass
+class Density:
+    """In-memory density representation"""
+    symbol:       str
+    side:         str
+    price:        float
+    notional:     float
+    current_price: float
+    exchange:     str = "binance"
+    first_seen:   float = field(default_factory=time.time)
+    last_notified: float = 0.0
+    last_notional: float = 0.0
+    db_id:        Optional[int] = None  # PostgreSQL ID
+
+    @property
+    def key(self):
+        return (self.symbol, round(self.price, 8), self.side)
+
+    @property
+    def distance_pct(self) -> float:
+        if self.current_price == 0:
+            return 999.0
+        return abs(self.current_price - self.price) / self.current_price
+
+    @property
+    def age_sec(self) -> float:
+        return time.time() - self.first_seen
+
+    @property
+    def side_emoji(self) -> str:
+        return "🟢 BID" if self.side == "bids" else "🔴 ASK"
+
+    @property
+    def side_label(self) -> str:
+        return "BID (поддержка)" if self.side == "bids" else "ASK (сопротивление)"
+
+    def should_notify(self) -> bool:
+        """Should send/update notification?"""
+        if self.age_sec < settings.min_lifetime_sec:
+            return False
+        if self.last_notified == 0.0:
+            return True
+        if self.last_notional > 0:
+            change = abs(self.notional - self.last_notional) / self.last_notional
+            if change >= settings.change_threshold_pct:
+                return True
+        return False
+
+    def mark_notified(self):
+        self.last_notified = time.time()
+        self.last_notional = self.notional
+
+    def to_dict(self) -> dict:
+        return {
+            'exchange': self.exchange,
+            'symbol': self.symbol,
+            'side': self.side,
+            'price': self.price,
+            'notional': self.notional,
+            'current_price': self.current_price,
+            'distance_pct': self.distance_pct,
+            'age_sec': self.age_sec,
+            'first_seen': self.first_seen,
+            'side_emoji': self.side_emoji
+        }
+
+
+# ═══════════════════════════════════════════════════════
+#  DENSITY STORE (with Redis + PostgreSQL)
+# ═══════════════════════════════════════════════════════
+class DensityStore:
+    """Storage with triple-layer architecture:
+    1. Memory cache (instant access)
+    2. Redis cache (300s TTL, shared between processes)
+    3. PostgreSQL (persistent history)
+    """
+
+    def __init__(self, exchange: str = "binance"):
+        self.exchange = exchange
+        self._store: dict[tuple, Density] = {}
+
+    async def update(self, symbol: str, side: str, price: float,
+                    notional: float, current_price: float) -> Optional[Density]:
+        """Update or create density with full persistence"""
+        key = (symbol, round(price, 8), side)
+        distance_pct = abs(current_price - price) / current_price if current_price else 999.0
+
+        if key in self._store:
+            d = self._store[key]
+            d.notional = notional
+            d.current_price = current_price
+            
+            # Update Redis cache
+            await db.cache_density(
+                self.exchange, symbol, side, price,
+                d.to_dict(),
+                ttl=300
+            )
+            
+            # Update PostgreSQL (async, non-blocking)
+            asyncio.create_task(
+                db.upsert_density(
+                    self.exchange, symbol, side, price,
+                    notional, current_price, distance_pct
+                )
+            )
+        else:
+            # New density
+            d = Density(
+                exchange=self.exchange,
+                symbol=symbol,
+                side=side,
+                price=price,
+                notional=notional,
+                current_price=current_price
+            )
+            self._store[key] = d
+            log.info(f"🕒 New density: {symbol} {d.side_emoji} @ {price:.6g} ({notional:,.0f}$)")
+
+            # Cache in Redis
+            await db.cache_density(
+                self.exchange, symbol, side, price,
+                d.to_dict(),
+                ttl=300
+            )
+
+            # Save to PostgreSQL + log event
+            async def save_new():
+                density_db = await db.upsert_density(
+                    self.exchange, symbol, side, price,
+                    notional, current_price, distance_pct
+                )
+                d.db_id = density_db.id
+                await db.log_event(
+                    density_db.id, 'detected',
+                    price_at_event=current_price,
+                    distance_pct=distance_pct,
+                    notional=notional
+                )
+
+            asyncio.create_task(save_new())
+
+        if d.distance_pct > settings.max_distance_pct:
+            return None
+
+        if d.should_notify():
+            d.mark_notified()
+            
+            # Log approach event if close
+            if d.distance_pct <= settings.near_distance_pct and d.db_id:
+                asyncio.create_task(
+                    db.log_event(
+                        d.db_id, 'approached',
+                        price_at_event=current_price,
+                        distance_pct=distance_pct,
+                        notional=notional
+                    )
+                )
+            
+            return d
+        return None
+
+    async def remove(self, key: tuple):
+        """Mark density as disappeared"""
+        if key in self._store:
+            d = self._store.pop(key)
+            log.info(f"❌ Density disappeared: {d.symbol} {d.side_emoji} @ {d.price:.6g}")
+
+            # Mark inactive in PostgreSQL
+            asyncio.create_task(
+                db.mark_density_inactive(d.exchange, d.symbol, d.side, d.price)
+            )
+            
+            # Log event
+            if d.db_id:
+                asyncio.create_task(
+                    db.log_event(d.db_id, 'disappeared')
+                )
+
+    def all_active(self) -> List[Density]:
+        """All densities within MAX_DISTANCE_PCT"""
+        return [d for d in self._store.values() if d.distance_pct <= settings.max_distance_pct]
+
+    def near(self, threshold=None) -> List[Density]:
+        """Densities very close to price"""
+        threshold = threshold or settings.near_distance_pct
+        return sorted(
+            [d for d in self._store.values() if d.distance_pct <= threshold],
+            key=lambda d: d.notional, reverse=True
+        )
+
+    def top(self, n=None) -> List[Density]:
+        """Top-N largest active densities"""
+        n = n or settings.top_densities_per_msg
+        return sorted(self.all_active(), key=lambda d: d.notional, reverse=True)[:n]
+
+    def by_symbol(self, symbol: str) -> List[Density]:
+        """All densities for symbol"""
+        sym = symbol.upper()
+        if not sym.endswith("USDT"):
+            sym += "USDT"
+        return sorted(
+            [d for d in self._store.values() if d.symbol == sym],
+            key=lambda d: d.notional, reverse=True
+        )
+
+    async def cleanup_symbol(self, symbol: str, seen_keys: set):
+        """Remove densities for symbol not in seen_keys"""
+        to_remove = [
+            k for k in list(self._store)
+            if k[0] == symbol and k not in seen_keys
+        ]
+        for k in to_remove:
+            await self.remove(k)
+
+
+# ═══════════════════════════════════════════════════════
+#  MESSAGE FORMATTERS
+# ═══════════════════════════════════════════════════════
+def fmt_density(d: Density) -> str:
+    near_tag = " 🔥 ВПЛОТНУЮ" if d.distance_pct <= settings.near_distance_pct else ""
+    return (
+        f"Монета: {d.symbol}\n"
+        f"Сторона: {d.side_emoji} ({d.side_label}){near_tag}\n"
+        f"Цена плотности: {d.price:.6g}\n"
+        f"Текущая цена:   {d.current_price:.6g}\n"
+        f"💰 Размер: {d.notional:,.0f}$\n"
+        f"📏 Расстояние: {d.distance_pct*100:.2f}%"
+    )
+
+def fmt_batch(densities: List[Density]) -> List[str]:
+    """Group densities into messages (max ~4000 chars each)"""
+    header = "📊 *Плотности в стакане*\n" + "━" * 20 + "\n\n"
+    sep = "\n" + "━" * 16 + "\n\n"
+
+    messages = []
+    current_parts = []
+    current_len = len(header)
+
+    by_sym: dict[str, List[Density]] = defaultdict(list)
+    for d in densities:
+        if len(by_sym[d.symbol]) < settings.top_per_symbol:
+            by_sym[d.symbol].append(d)
+
+    flat = [d for lst in by_sym.values() for d in lst]
+    flat.sort(key=lambda d: d.distance_pct)
+
+    for d in flat:
+        block = fmt_density(d)
+        block_len = len(block) + len(sep)
+        if current_len + block_len > 3800 and current_parts:
+            messages.append(header + sep.join(current_parts))
+            current_parts = []
+            current_len = len(header)
+        current_parts.append(block)
+        current_len += block_len
+
+    if current_parts:
+        messages.append(header + sep.join(current_parts))
+
+    return messages
+
+def fmt_top(densities: List[Density]) -> str:
+    if not densities:
+        return "🏆 Нет крупных плотностей в зоне наблюдения."
+    lines = ["🏆 *Топ плотностей*\n" + "━" * 20]
+    for i, d in enumerate(densities, 1):
+        lines.append(
+            f"{i}. {d.symbol} {d.side_emoji}\n"
+            f"   💰 {d.notional:,.0f}$ | 📏 {d.distance_pct*100:.2f}% | {d.price:.6g}"
+        )
+    return "\n\n".join(lines)
+
+def fmt_near(densities: List[Density]) -> str:
+    if not densities:
+        return f"🔥 Нет плотностей ближе {settings.near_distance_pct*100:.1f}% от цены."
+    lines = [f"🔥 *Плотности вплотную (< {settings.near_distance_pct*100:.1f}%)*\n" + "━" * 20]
+    for d in densities:
+        lines.append(
+            f"{d.symbol} {d.side_emoji}\n"
+            f"   💰 {d.notional:,.0f}$ | 📏 {d.distance_pct*100:.2f}%\n"
+            f"   Плотность @ {d.price:.6g} | Цена @ {d.current_price:.6g}"
+        )
+    return "\n\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════
+#  PRICE CACHE (WebSocket)
+# ═══════════════════════════════════════════════════════
+price_cache: dict[str, float] = {}
+
+async def run_price_websocket():
+    """WebSocket for realtime prices"""
+    url = "wss://fstream.binance.com/ws/!miniTicker@arr"
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(url) as ws:
+                    log.info("🔌 WebSocket prices connected")
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            for t in json.loads(msg.data):
+                                symbol = t["s"]
+                                price = float(t["c"])
+                                price_cache[symbol] = price
+                                # Also cache in Redis for API access
+                                await db.cache_price(symbol, price)
+                        elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
+                            break
+        except Exception as e:
+            log.error(f"WebSocket error: {e} — reconnecting in 5s")
+        await asyncio.sleep(5)
+
+
+# ═══════════════════════════════════════════════════════
+#  FETCHERS
+# ═══════════════════════════════════════════════════════
+async def fetch_futures_symbols() -> List[str]:
+    """Fetch USDT futures symbols with volume filter"""
+    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            data = await resp.json()
+            symbols = [
+                item["symbol"] for item in data
+                if item["symbol"].endswith("USDT")
+                and item["symbol"] not in settings.excluded_symbols
+                and float(item["quoteVolume"]) >= settings.volume_threshold
+            ]
+            
+            # Add to active symbols in Redis
+            for sym in symbols:
+                await db.add_to_active_symbols("binance", sym)
+            
+            return symbols
+
+async def scan_symbol(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    threshold: float,
+    store: DensityStore,
+) -> List[Density]:
+    """Scan orderbook for one symbol"""
+    url = f"https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit={settings.depth_levels}"
+    to_notify = []
+    seen_keys = set()
+
+    await asyncio.sleep(settings.request_delay)
+    try:
+        async with session.get(url) as resp:
+            used = int(resp.headers.get("x-mbx-used-weight-1m", 0))
+            if used > 1800:
+                log.warning(f"⚠️ Rate limit {used}/2400 — pause 30s")
+                await asyncio.sleep(30)
+
+            data = await resp.json()
+            current_price = price_cache.get(symbol)
+            if current_price is None:
+                return []
+
+            for side in ("bids", "asks"):
+                for level in data.get(side, []):
+                    price = float(level[0])
+                    notional = price * float(level[1])
+
+                    if notional < threshold:
+                        continue
+
+                    key = (symbol, round(price, 8), side)
+                    seen_keys.add(key)
+
+                    result = await store.update(symbol, side, price, notional, current_price)
+                    if result:
+                        to_notify.append(result)
+
+            await store.cleanup_symbol(symbol, seen_keys)
+
+    except aiohttp.ClientResponseError as e:
+        if e.status == 429:
+            log.error(f"🚫 429 for {symbol} — pause 60s")
+            await asyncio.sleep(60)
+        elif e.status == 418:
+            log.error(f"🚫 418 IP ban — pause 5min!")
+            await asyncio.sleep(300)
+        else:
+            log.error(f"HTTP {e.status} for {symbol}")
+    except Exception as e:
+        log.error(f"Error scanning {symbol}: {e}")
+
+    return to_notify
+
+
+# ═══════════════════════════════════════════════════════
+#  NOTIFIER
+# ═══════════════════════════════════════════════════════
+class Notifier:
+    def __init__(self, bot: Bot, chat_id: int):
+        self.bot = bot
+        self.chat_id = chat_id
+        self._paused = False
+
+    def pause(self):
+        self._paused = True
+    def resume(self):
+        self._paused = False
+    def is_paused(self):
+        return self._paused
+
+    def send(self, text: str, parse_mode="Markdown"):
+        if self._paused:
+            return
+        try:
+            self.bot.send_message(chat_id=self.chat_id, text=text, parse_mode=parse_mode)
+        except Exception as e:
+            log.error(f"Telegram error: {e}")
+
+    def send_batch(self, densities: List[Density]):
+        if not densities or self._paused:
+            return
+        for msg in fmt_batch(densities):
+            self.send(msg)
+            time.sleep(0.5)
+
+    def send_top(self, store: DensityStore):
+        self.send(fmt_top(store.top()))
+
+    def send_near(self, store: DensityStore):
+        self.send(fmt_near(store.near()))
+
+    def send_symbol(self, store: DensityStore, symbol: str):
+        densities = store.by_symbol(symbol)
+        if not densities:
+            self.send(f"ℹ️ Нет плотностей для {symbol.upper()}")
+            return
+        self.send(fmt_batch(densities)[0])
+
+    def send_cycle_summary(self, store: DensityStore, symbols_count: int, cycle: int):
+        active = store.all_active()
+        near = store.near()
+        top3 = store.top(3)
+
+        top3_lines = "\n".join(
+            f"  {i}. {d.symbol} {d.side_emoji} — {d.notional:,.0f}$ @ {d.distance_pct*100:.2f}%"
+            for i, d in enumerate(top3, 1)
+        ) or "  —"
+
+        total_tracked = len(store._store)
+
+        self.send(
+            f"📡 *Цикл #{cycle} завершён*\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🔍 Монет: {symbols_count}\n"
+            f"📦 Отслеживается всего: {total_tracked}\n"
+            f"📊 В зоне (< {settings.max_distance_pct*100:.0f}%): {len(active)}\n"
+            f"🔥 Вплотную (< {settings.near_distance_pct*100:.0f}%): {len(near)}\n\n"
+            f"🏆 Топ-3:\n{top3_lines}"
+        )
+
+
+# ═══════════════════════════════════════════════════════
+#  TELEGRAM COMMANDER
+# ═══════════════════════════════════════════════════════
+def setup_commands(updater: Updater, notifier: Notifier, store: DensityStore):
+    dp: Dispatcher = updater.dispatcher
+
+    def cmd_top(update: Update, context):
+        notifier.send_top(store)
+
+    def cmd_near(update: Update, context):
+        notifier.send_near(store)
+
+    def cmd_symbol(update: Update, context):
+        if context.args:
+            notifier.send_symbol(store, context.args[0])
+        else:
+            notifier.send("Использование: /symbol SOL")
+
+    def cmd_pause(update: Update, context):
+        notifier.pause()
+        notifier.send("⏸ Уведомления приостановлены. /resume для возобновления.")
+
+    def cmd_resume(update: Update, context):
+        notifier.resume()
+        notifier.send("▶️ Уведомления возобновлены.")
+
+    def cmd_status(update: Update, context):
+        active = store.all_active()
+        near = store.near()
+        status = "⏸ Пауза" if notifier.is_paused() else "▶️ Активен"
+        notifier.send(
+            f"ℹ️ *Статус бота*\n"
+            f"Режим: {status}\n"
+            f"Плотностей в зоне: {len(active)}\n"
+            f"Вплотную: {len(near)}\n"
+            f"Цен в кэше: {len(price_cache)}"
+        )
+
+    dp.add_handler(CommandHandler("top", cmd_top))
+    dp.add_handler(CommandHandler("near", cmd_near))
+    dp.add_handler(CommandHandler("symbol", cmd_symbol))
+    dp.add_handler(CommandHandler("pause", cmd_pause))
+    dp.add_handler(CommandHandler("resume", cmd_resume))
+    dp.add_handler(CommandHandler("status", cmd_status))
+
+
+# ═══════════════════════════════════════════════════════
+#  MAIN LOOP
+# ═══════════════════════════════════════════════════════
+async def main():
+    log.info("🚀 Density Screener starting (Prod with Redis + PostgreSQL)")
+
+    # Initialize databases
+    await db.init_redis()
+    await db.init_db()
+
+    bot = Bot(token=settings.telegram_token)
+    store = DensityStore(exchange="binance")
+    notifier = Notifier(bot, settings.telegram_chat_id)
+
+    # Load thresholds from PostgreSQL
+    thresholds = await db.get_thresholds("binance")
+    log.info(f"📥 Loaded {len(thresholds)} custom thresholds from database")
+
+    # Telegram commands
+    updater = Updater(token=settings.telegram_token, use_context=True)
+    setup_commands(updater, notifier, store)
+    updater.start_polling()
+    log.info("📲 Telegram commands active: /top /near /symbol /pause /resume /status")
+
+    # WebSocket prices background
+    asyncio.create_task(run_price_websocket())
+    log.info("⏳ Waiting for price cache to fill (5s)...")
+    await asyncio.sleep(5)
+
+    cycle = 0
+    while True:
+        cycle += 1
+        try:
+            symbols = await fetch_futures_symbols()
+            log.info(f"═══ CYCLE #{cycle} | {len(symbols)} coins | {datetime.utcnow().strftime('%H:%M:%S')} UTC ═══")
+
+            all_to_notify: List[Density] = []
+
+            async with aiohttp.ClientSession() as session:
+                for i in range(0, len(symbols), settings.batch_size):
+                    batch = symbols[i:i + settings.batch_size]
+                    tasks = [
+                        scan_symbol(
+                            session, sym,
+                            thresholds.get(sym, settings.default_density_usd),
+                            store
+                        )
+                        for sym in batch
+                    ]
+                    results = await asyncio.gather(*tasks)
+                    for lst in results:
+                        all_to_notify.extend(lst)
+
+                    if i + settings.batch_size < len(symbols):
+                        await asyncio.sleep(settings.batch_delay)
+
+            # Notify new/changed densities
+            if all_to_notify:
+                log.info(f"📤 Notifying: {len(all_to_notify)} densities")
+                notifier.send_batch(all_to_notify)
+
+            # Cycle summary
+            notifier.send_cycle_summary(store, len(symbols), cycle)
+
+            log.info(f"✅ Cycle #{cycle} complete. Next in {settings.update_interval}s.")
+            await asyncio.sleep(settings.update_interval)
+
+        except Exception as e:
+            log.error(f"Main loop error: {e}", exc_info=True)
+            await asyncio.sleep(10)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("🛑 Shutting down...")
+    finally:
+        asyncio.run(db.close())
