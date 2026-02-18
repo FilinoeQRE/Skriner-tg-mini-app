@@ -1,0 +1,97 @@
+"""
+Configuration management for Density Screener
+Supports environment variables and .env file
+"""
+
+import os
+from typing import Optional
+from pydantic import Field
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    """Application settings with validation"""
+    
+    # ═══════════════════════════════════════════════════════
+    #  TELEGRAM
+    # ═══════════════════════════════════════════════════════
+    telegram_token: str = Field(..., env="TELEGRAM_TOKEN")
+    telegram_chat_id: int = Field(..., env="TELEGRAM_CHAT_ID")
+    
+    # ═══════════════════════════════════════════════════════
+    #  REDIS
+    # ═══════════════════════════════════════════════════════
+    redis_host: str = Field(default="localhost", env="REDIS_HOST")
+    redis_port: int = Field(default=6379, env="REDIS_PORT")
+    redis_db: int = Field(default=0, env="REDIS_DB")
+    redis_password: Optional[str] = Field(default=None, env="REDIS_PASSWORD")
+    
+    # ═══════════════════════════════════════════════════════
+    #  POSTGRESQL
+    # ═══════════════════════════════════════════════════════
+    postgres_host: str = Field(default="localhost", env="POSTGRES_HOST")
+    postgres_port: int = Field(default=5432, env="POSTGRES_PORT")
+    postgres_db: str = Field(default="density_screener", env="POSTGRES_DB")
+    postgres_user: str = Field(default="screener", env="POSTGRES_USER")
+    postgres_password: str = Field(default="screener_password_change_me", env="POSTGRES_PASSWORD")
+    
+    @property
+    def postgres_url(self) -> str:
+        return (
+            f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+        )
+    
+    @property
+    def postgres_url_sync(self) -> str:
+        """For alembic migrations (sync driver)"""
+        return (
+            f"postgresql://{self.postgres_user}:{self.postgres_password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+        )
+    
+    # ═══════════════════════════════════════════════════════
+    #  SCREENER PARAMETERS
+    # ═══════════════════════════════════════════════════════
+    excluded_symbols: set[str] = Field(default={"BTCUSDT", "ETHUSDT"})
+    volume_threshold: int = Field(default=50_000_000, env="VOLUME_THRESHOLD")
+    depth_levels: int = Field(default=500, env="DEPTH_LEVELS")
+    update_interval: int = Field(default=60, env="UPDATE_INTERVAL")
+    
+    default_density_usd: int = Field(default=1_000_000, env="DEFAULT_DENSITY_USD")
+    max_distance_pct: float = Field(default=0.05, env="MAX_DISTANCE_PCT")
+    near_distance_pct: float = Field(default=0.01, env="NEAR_DISTANCE_PCT")
+    min_lifetime_sec: int = Field(default=60, env="MIN_LIFETIME_SEC")
+    change_threshold_pct: float = Field(default=0.10, env="CHANGE_THRESHOLD_PCT")
+    
+    top_densities_per_msg: int = Field(default=10)
+    top_per_symbol: int = Field(default=3)
+    
+    # ═══════════════════════════════════════════════════════
+    #  RATE LIMITING
+    # ═══════════════════════════════════════════════════════
+    batch_size: int = Field(default=10, env="BATCH_SIZE")
+    batch_delay: float = Field(default=2.0, env="BATCH_DELAY")
+    request_delay: float = Field(default=0.2, env="REQUEST_DELAY")
+    
+    # ═══════════════════════════════════════════════════════
+    #  API SERVER
+    # ═══════════════════════════════════════════════════════
+    api_host: str = Field(default="0.0.0.0", env="API_HOST")
+    api_port: int = Field(default=8000, env="API_PORT")
+    api_reload: bool = Field(default=False, env="API_RELOAD")
+    
+    # ═══════════════════════════════════════════════════════
+    #  LOGGING
+    # ═══════════════════════════════════════════════════════
+    log_level: str = Field(default="INFO", env="LOG_LEVEL")
+    log_file: str = Field(default="screener.log", env="LOG_FILE")
+    
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        case_sensitive = False
+
+
+# Singleton instance
+settings = Settings()
